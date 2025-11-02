@@ -57,6 +57,7 @@ class BatteryPredictionDashboard:
                 if isinstance(model_data, dict):
                     # Enhanced model format
                     from src.models.battery_predictor import BatteryPredictionModel
+                    from src.features.feature_engineer import PredictionFeatureBuilder
 
                     predictor = BatteryPredictionModel()
                     predictor.model = model_data['model']
@@ -64,6 +65,12 @@ class BatteryPredictionDashboard:
                     predictor.feature_names = model_data.get('feature_cols', model_data.get('feature_names', []))
 
                     self.service.model = predictor
+
+                    # Initialize feature builder for predictions
+                    self.service.feature_builder = PredictionFeatureBuilder(
+                        predictor.feature_engineer,
+                        self.df
+                    )
 
                     # Get performance stats
                     perf = model_data.get('performance', {})
@@ -98,17 +105,73 @@ class BatteryPredictionDashboard:
             return "❌ Please load the system first", None
 
         try:
+            # Convert IDs to integers (Gradio sends them as strings)
+            vehicle_id = int(vehicle_id)
+            user_id = int(user_id)
+
             # Parse datetime
             booking_datetime = datetime.fromisoformat(f"{booking_date}T{booking_time}")
 
+            # Create a simple prediction using the model directly
+            # Get last booking for this vehicle
+            vehicle_data = self.df[self.df['vehicle_id'] == vehicle_id].sort_values('starts_at')
+
+            if len(vehicle_data) == 0:
+                return f"❌ No historical data found for vehicle {vehicle_id}", None
+
+            last_booking = vehicle_data.iloc[-1]
+
+            # Create prediction row
+            from src.features.enhanced_features import EnhancedBatteryFeatures
+
+            pred_row = pd.DataFrame([{
+                'booking_id': f"PRED_{datetime.now().timestamp()}",
+                'vehicle_id': vehicle_id,
+                'user_id': user_id,
+                'starts_at': booking_datetime,
+                'ends_at': booking_datetime + timedelta(hours=2),
+                'battery_at_start': 0,  # Predicting this
+                'battery_at_end': 0,
+                'mileage_at_start': 0,
+                'mileage_at_end': 0,
+                'charging_at_end': 0
+            }])
+
+            # Add enhanced charging features
+            enhancer = EnhancedBatteryFeatures()
+            enhancer.vehicle_charging_stats = self.service.model.feature_engineer.vehicle_stats if hasattr(self.service.model, 'feature_engineer') else {}
+            enhancer.user_charging_stats = self.service.model.feature_engineer.user_stats if hasattr(self.service.model, 'feature_engineer') else {}
+
+            # Combine with historical data for feature creation
+            combined = pd.concat([self.df, pred_row]).sort_values(['vehicle_id', 'starts_at'])
+            enhanced = enhancer.create_charging_features(combined, is_training=False)
+            enhanced = self.service.model.feature_engineer.create_features(enhanced, is_training=False)
+
+            # Get the prediction row
+            pred_features = enhanced[enhanced['booking_id'] == pred_row['booking_id'].iloc[0]]
+
             # Make prediction
-            result = self.service.predict_battery_at_start(
-                vehicle_id=vehicle_id,
-                user_id=user_id,
-                booking_start_time=booking_datetime,
-                booking_id=f"PRED_{datetime.now().timestamp()}",
-                update_timeline=False
-            )
+            X = pred_features[self.service.model.feature_names]
+            prediction = float(self.service.model.model.predict(X)[0])
+            prediction = np.clip(prediction, 0, 100)
+
+            # Create result dict
+            result = {
+                'booking_id': f"PRED_{datetime.now().timestamp()}",
+                'vehicle_id': vehicle_id,
+                'user_id': user_id,
+                'booking_start_time': booking_datetime.isoformat(),
+                'predicted_battery_percentage': prediction,
+                'confidence_interval': {
+                    'lower': max(0, prediction - 10),
+                    'upper': min(100, prediction + 10),
+                    'confidence_level': 0.95
+                },
+                'last_known_battery': float(last_booking['battery_at_end']),
+                'time_since_last_booking_hours': float((booking_datetime - last_booking['ends_at']).total_seconds() / 3600),
+                'intermediate_bookings_count': 0,
+                'timestamp': datetime.now().isoformat()
+            }
 
             # Format output
             output = f"""
@@ -126,8 +189,8 @@ class BatteryPredictionDashboard:
 - Upper Bound: {result['confidence_interval']['upper']:.1f}%
 
 ### Context
-- Last Known Battery: {result['last_known_battery']:.1f if result['last_known_battery'] else 'N/A'}%
-- Time Since Last Booking: {result['time_since_last_booking_hours']:.1f if result['time_since_last_booking_hours'] else 'N/A'} hours
+- Last Known Battery: {result['last_known_battery']:.1f}%
+- Time Since Last Booking: {result['time_since_last_booking_hours']:.1f} hours
 - Intermediate Bookings: {result['intermediate_bookings_count']}
             """
 
@@ -177,6 +240,9 @@ class BatteryPredictionDashboard:
             return "❌ Please load the system first", None
 
         try:
+            # Convert ID to integer (Gradio sends it as string)
+            vehicle_id = int(vehicle_id)
+
             # Get vehicle data
             vehicle_data = self.df[self.df['vehicle_id'] == vehicle_id].sort_values('starts_at')
 
@@ -317,6 +383,10 @@ class BatteryPredictionDashboard:
             return "❌ Please load the system first", None
 
         try:
+            # Convert IDs to integers (Gradio sends them as strings)
+            vehicle_id = int(vehicle_id)
+            user_id = int(user_id)
+
             # Get current time (last booking time for this vehicle)
             vehicle_data = self.df[self.df['vehicle_id'] == vehicle_id]
             if len(vehicle_data) == 0:
