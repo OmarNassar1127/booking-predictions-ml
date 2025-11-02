@@ -127,6 +127,14 @@ class BatteryFeatureEngineer:
         df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
         df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
+        # NEW: Rush hour feature (7-9am, 5-7pm)
+        df['is_rush_hour'] = (((df['hour_of_day'] >= 7) & (df['hour_of_day'] <= 8)) |
+                               ((df['hour_of_day'] >= 17) & (df['hour_of_day'] <= 18))).astype(int)
+
+        # NEW: Explicit season feature
+        # Winter (Dec, Jan, Feb): 0, Spring (Mar, Apr, May): 1, Summer (Jun, Jul, Aug): 2, Fall (Sep, Oct, Nov): 3
+        df['season'] = ((df['month'] % 12 + 3) // 3) % 4
+
         return df
 
     def _add_vehicle_features(self, df: pd.DataFrame, is_training: bool) -> pd.DataFrame:
@@ -155,9 +163,81 @@ class BatteryFeatureEngineer:
         # Vehicle booking count (up to this point in time)
         df['vehicle_booking_count'] = df.groupby('vehicle_id').cumcount()
 
+        # NEW: Vehicle usage intensity (bookings per week)
+        # Calculate time span for each vehicle up to current booking
+        df['vehicle_days_active'] = (
+            df.groupby('vehicle_id')['starts_at']
+            .transform(lambda x: (x - x.min()).dt.total_seconds() / (24 * 3600))
+        )
+        df['vehicle_usage_intensity'] = np.where(
+            df['vehicle_days_active'] > 0,
+            (df['vehicle_booking_count'] + 1) / (df['vehicle_days_active'] / 7),
+            0
+        )
+
         # Battery at end of last booking (for this vehicle)
         df['prev_battery_end'] = df.groupby('vehicle_id')['battery_at_end'].shift(1)
         df['prev_battery_end'] = df['prev_battery_end'].fillna(80)  # Default for first booking
+
+        # NEW: Vehicle charging efficiency (% gained per hour when charging)
+        if is_training and 'charging_at_end' in df.columns:
+            # Calculate charging rate for bookings that had charging
+            charging_bookings = df[df['charging_at_end'] == 1].copy()
+            charging_bookings['next_battery_start'] = charging_bookings.groupby('vehicle_id')['battery_at_start'].shift(-1)
+            charging_bookings['next_starts_at'] = charging_bookings.groupby('vehicle_id')['starts_at'].shift(-1)
+            charging_bookings['charging_gap_hours'] = (
+                (charging_bookings['next_starts_at'] - charging_bookings['ends_at']).dt.total_seconds() / 3600
+            )
+            charging_bookings['battery_gained'] = charging_bookings['next_battery_start'] - charging_bookings['battery_at_end']
+            charging_bookings['charging_rate'] = np.where(
+                charging_bookings['charging_gap_hours'] > 0,
+                charging_bookings['battery_gained'] / charging_bookings['charging_gap_hours'],
+                0
+            )
+            # Filter reasonable rates (5-50% per hour)
+            valid_rates = charging_bookings[
+                (charging_bookings['charging_rate'] >= 5) &
+                (charging_bookings['charging_rate'] <= 50)
+            ]
+            vehicle_charging_efficiency = valid_rates.groupby('vehicle_id')['charging_rate'].mean().to_dict()
+            self.vehicle_stats['charging_efficiency'] = vehicle_charging_efficiency
+
+        if 'charging_efficiency' in self.vehicle_stats:
+            df['vehicle_charging_efficiency'] = df['vehicle_id'].map(
+                self.vehicle_stats['charging_efficiency']
+            ).fillna(25.0)  # Default 25%/hour
+        else:
+            df['vehicle_charging_efficiency'] = 25.0
+
+        # NEW: Vehicle average idle drain rate (battery loss when parked between bookings)
+        if is_training:
+            # Calculate idle drain: difference between battery_at_end and next battery_at_start (when not charging)
+            no_charge_bookings = df[df.get('charging_at_end', 0) == 0].copy()
+            no_charge_bookings['next_battery_start'] = no_charge_bookings.groupby('vehicle_id')['battery_at_start'].shift(-1)
+            no_charge_bookings['next_starts_at'] = no_charge_bookings.groupby('vehicle_id')['starts_at'].shift(-1)
+            no_charge_bookings['idle_gap_hours'] = (
+                (no_charge_bookings['next_starts_at'] - no_charge_bookings['ends_at']).dt.total_seconds() / 3600
+            )
+            no_charge_bookings['battery_lost'] = no_charge_bookings['battery_at_end'] - no_charge_bookings['next_battery_start']
+            no_charge_bookings['idle_drain_rate'] = np.where(
+                no_charge_bookings['idle_gap_hours'] > 0,
+                no_charge_bookings['battery_lost'] / no_charge_bookings['idle_gap_hours'],
+                0
+            )
+            # Filter reasonable rates (0-2% per hour)
+            valid_idle_rates = no_charge_bookings[
+                (no_charge_bookings['idle_drain_rate'] >= 0) &
+                (no_charge_bookings['idle_drain_rate'] <= 2)
+            ]
+            vehicle_idle_drain = valid_idle_rates.groupby('vehicle_id')['idle_drain_rate'].mean().to_dict()
+            self.vehicle_stats['idle_drain_rate'] = vehicle_idle_drain
+
+        if 'idle_drain_rate' in self.vehicle_stats:
+            df['vehicle_avg_idle_drain_rate'] = df['vehicle_id'].map(
+                self.vehicle_stats['idle_drain_rate']
+            ).fillna(0.5)  # Default 0.5%/hour
+        else:
+            df['vehicle_avg_idle_drain_rate'] = 0.5
 
         return df
 
@@ -185,6 +265,33 @@ class BatteryFeatureEngineer:
 
         # User booking count
         df['user_booking_count'] = df.groupby('user_id').cumcount()
+
+        # NEW: User charging frequency (% of bookings where they charge)
+        if is_training and 'charging_at_end' in df.columns:
+            user_charging_freq = df.groupby('user_id')['charging_at_end'].mean().to_dict()
+            self.user_stats['charging_frequency'] = user_charging_freq
+
+        if 'charging_frequency' in self.user_stats:
+            df['user_charging_frequency'] = df['user_id'].map(
+                self.user_stats['charging_frequency']
+            ).fillna(0.25)  # Default 25% charge rate
+        else:
+            df['user_charging_frequency'] = 0.25
+
+        # NEW: User preferred booking hours (mode of booking start hour)
+        if is_training:
+            user_pref_hours = df.groupby('user_id')['hour_of_day'].agg(lambda x: x.mode()[0] if len(x.mode()) > 0 else x.mean()).to_dict()
+            self.user_stats['preferred_hour'] = user_pref_hours
+
+        if 'preferred_hour' in self.user_stats:
+            df['user_preferred_hour'] = df['user_id'].map(
+                self.user_stats['preferred_hour']
+            ).fillna(12)  # Default noon
+        else:
+            df['user_preferred_hour'] = 12
+
+        # Deviation from preferred hour
+        df['hour_deviation_from_preferred'] = np.abs(df['hour_of_day'] - df['user_preferred_hour'])
 
         return df
 
@@ -215,6 +322,27 @@ class BatteryFeatureEngineer:
             df['time_since_last_booking_hours'] * 10,  # Assume ~10% per hour charging
             100 - df['prev_battery_end']  # Can't charge beyond 100%
         )
+
+        # NEW: Days since last charging event for this vehicle
+        if 'charging_at_end' in df.columns:
+            # Mark each booking's end time when charging happened
+            df['charge_end_time'] = df['ends_at'].where(df['charging_at_end'] == 1, pd.NaT)
+
+            # Forward-fill to get the last charge time for each subsequent booking
+            df['last_charge_time'] = df.groupby('vehicle_id')['charge_end_time'].fillna(method='ffill')
+
+            # Calculate days since last charge
+            df['days_since_last_charge'] = (
+                (df['starts_at'] - df['last_charge_time']).dt.total_seconds() / (24 * 3600)
+            )
+
+            # Fill NaN with large number (vehicle never charged before)
+            df['days_since_last_charge'] = df['days_since_last_charge'].fillna(30)  # Default 30 days
+
+            # Drop temporary columns
+            df = df.drop(['charge_end_time', 'last_charge_time'], axis=1)
+        else:
+            df['days_since_last_charge'] = 30  # Default if no charging data
 
         return df
 
@@ -251,6 +379,31 @@ class BatteryFeatureEngineer:
 
         # Vehicle-user interactions
         df['vehicle_user_combo'] = df['vehicle_id'].astype(str) + '_' + df['user_id'].astype(str)
+
+        # NEW: User-vehicle familiarity (how many times this user has used this vehicle before)
+        df['user_vehicle_familiarity_count'] = df.groupby(['vehicle_id', 'user_id']).cumcount()
+
+        # Binary flag for whether user is familiar with this vehicle (>2 bookings)
+        df['is_familiar_with_vehicle'] = (df['user_vehicle_familiarity_count'] > 2).astype(int)
+
+        # NEW: Community-vehicle pairing strength (how common this community-vehicle pairing is)
+        if 'account_community_id' in df.columns:
+            # Calculate total bookings per community-vehicle pair
+            community_vehicle_counts = df.groupby(['account_community_id', 'vehicle_id']).size()
+
+            # Calculate total bookings per community
+            community_total_counts = df.groupby('account_community_id').size()
+
+            # Pairing strength = proportion of community's bookings that use this vehicle
+            pairing_strength = (community_vehicle_counts / community_total_counts).to_dict()
+
+            # Map to dataframe
+            df['community_vehicle_pairing'] = df.apply(
+                lambda row: pairing_strength.get((row['account_community_id'], row['vehicle_id']), 0),
+                axis=1
+            )
+        else:
+            df['community_vehicle_pairing'] = 0
 
         # Expected battery based on simple heuristics
         df['expected_battery_simple'] = np.clip(
