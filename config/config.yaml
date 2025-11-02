@@ -1,0 +1,106 @@
+# Battery Prediction System Configuration
+
+# Data paths
+data:
+  raw_data_path: "data/processed/cleaned_bookings.csv"
+  processed_data_path: "data/processed/features.csv"
+  predictions_path: "data/predictions/"
+
+# Model configuration
+model:
+  type: "lightgbm"  # Options: lightgbm, xgboost, ensemble
+  save_path: "models/battery_predictor.pkl"
+  feature_importance_path: "models/feature_importance.csv"
+
+  # Model hyperparameters
+  hyperparameters:
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 7
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+
+# Feature engineering
+features:
+  # Time-based features
+  temporal_features:
+    - hour_of_day
+    - day_of_week
+    - is_weekend
+    - month
+    - is_holiday
+
+  # Historical aggregation windows (in days)
+  aggregation_windows: [7, 14, 30]
+
+  # Sequence length for vehicle history
+  sequence_length: 10
+
+# Training configuration
+training:
+  test_size: 0.2
+  validation_size: 0.1
+  time_based_split: true  # Use chronological split
+  min_bookings_per_vehicle: 5  # Minimum bookings to include vehicle
+  min_bookings_per_user: 3
+
+# Prediction configuration
+prediction:
+  confidence_level: 0.95
+  min_confidence_threshold: 0.6
+  max_prediction_horizon_days: 30  # Don't predict beyond 30 days
+
+  # Cold start strategy
+  cold_start:
+    new_vehicle_strategy: "fleet_average"  # Options: fleet_average, similar_vehicle
+    new_user_strategy: "vehicle_average"
+    similarity_threshold: 0.8
+
+# Dynamic updates
+updates:
+  enable_dynamic_updates: true
+  update_affected_only: true  # Only update affected vehicle timeline
+  cache_predictions: true
+  cache_ttl_seconds: 3600  # 1 hour
+
+# API configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: true
+  cors_origins:
+    - "http://localhost"
+    - "http://localhost:8080"
+    - "*"  # Update this in production
+
+  # Rate limiting
+  rate_limit:
+    enabled: true
+    max_requests_per_minute: 100
+
+  # Authentication (configure based on Laravel setup)
+  authentication:
+    enabled: false  # Set to true in production
+    api_key_header: "X-API-Key"
+
+# Dashboard configuration
+dashboard:
+  port: 7860
+  share: false  # Set to true to create public link
+  show_error_details: true
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "logs/app.log"
+  max_log_size_mb: 100
+  backup_count: 5
+
+# Performance
+performance:
+  n_jobs: -1  # Use all CPU cores
+  enable_gpu: false
+  batch_size: 1000

@@ -1,0 +1,44 @@
+# Core ML Libraries
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+xgboost>=2.0.0
+
+# Deep Learning (optional, for advanced models)
+torch>=2.0.0
+tensorflow>=2.13.0
+
+# Data Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Dashboard
+gradio>=4.0.0
+
+# Utilities
+python-dateutil>=2.8.2
+pytz>=2023.3
+pyyaml>=6.0
+joblib>=1.3.0
+tqdm>=4.65.0
+
+# Development
+jupyter>=1.0.0
+notebook>=7.0.0
+ipywidgets>=8.0.0
+
+# Testing
+pytest>=7.4.0
+httpx>=0.25.0  # for testing FastAPI
+
+# Database (if needed for caching)
+redis>=5.0.0
+sqlalchemy>=2.0.0

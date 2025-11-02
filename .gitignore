@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Environment
+.env
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data - CRITICAL: Never commit real booking data!
+data/raw/*.csv
+data/processed/*.csv
+data/predictions/*.csv
+data/**/*.csv
+!data/**/sample_*.csv  # Allow sample data files
+!data/**/example_*.csv  # Allow example data files
+*.parquet
+*.feather
+
+# Models - CRITICAL: Trained models contain learned patterns from private data
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.pt
+models/*.pth
+models/*.onnx
+*.pkl
+*.joblib
+
+# Logs - May contain sensitive debug information
+logs/
+*.log
+*.log.*
+
+# Notebook outputs - May contain data samples
+*.ipynb
+!notebooks/*.ipynb  # Keep notebook structure but...
+notebooks/**/*_files/  # ...exclude output files
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+*.cache
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Gradio
+gradio_cached_examples/
+flagged/
+
+GITHUB_SAFETY.md
