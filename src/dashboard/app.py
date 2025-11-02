@@ -40,40 +40,50 @@ class BatteryPredictionDashboard:
             loader = BookingDataLoader(data_path)
             self.df = loader.load()
 
-            # Load or create model
+            # Load model directly
             model_path = Path(model_path)
 
             if model_path.exists():
                 logger.info(f"Loading existing model from {model_path}")
-                self.service = BatteryPredictionService(
-                    model_path=str(model_path),
-                    historical_data=self.df
-                )
-            else:
-                logger.info("Training new model...")
+
+                # Load the model pickle file directly
+                import joblib
+                model_data = joblib.load(model_path)
+
+                # Create service and set components
                 self.service = BatteryPredictionService(historical_data=self.df)
 
-                # Train model
-                model = BatteryPredictionModel()
-                train_df, val_df, test_df = model.prepare_data(self.df)
-                metrics = model.train(train_df, val_df)
-                test_metrics = model.evaluate(test_df)
+                # Set the loaded model components
+                if isinstance(model_data, dict):
+                    # Enhanced model format
+                    from src.models.battery_predictor import BatteryPredictionModel
 
-                # Save model
-                model_path.parent.mkdir(parents=True, exist_ok=True)
-                model.save(str(model_path))
+                    predictor = BatteryPredictionModel()
+                    predictor.model = model_data['model']
+                    predictor.feature_engineer = model_data.get('feature_engineer')
+                    predictor.feature_names = model_data.get('feature_cols', model_data.get('feature_names', []))
 
-                # Load into service
-                self.service.load_model(str(model_path))
+                    self.service.model = predictor
 
-                return f"✓ Model trained and loaded\nTest MAE: {test_metrics['mae']:.2f}%\nTest R²: {test_metrics['r2']:.4f}"
+                    # Get performance stats
+                    perf = model_data.get('performance', {})
+                    mae = perf.get('test_mae', 'N/A')
+                    within_10 = perf.get('test_within_10', 'N/A')
 
-            self.model_loaded = True
-            return f"✓ System loaded successfully\n  - Bookings: {len(self.df)}\n  - Vehicles: {self.df['vehicle_id'].nunique()}\n  - Users: {self.df['user_id'].nunique()}"
+                    self.model_loaded = True
+                    return f"✓ Enhanced model loaded successfully\n  - Bookings: {len(self.df)}\n  - Vehicles: {self.df['vehicle_id'].nunique()}\n  - Users: {self.df['user_id'].nunique()}\n  - Model MAE: {mae:.2f}% | Within 10%: {within_10:.1f}%"
+                else:
+                    # Old model format - use service's load method
+                    self.service.load_model(str(model_path))
+                    self.model_loaded = True
+                    return f"✓ System loaded successfully\n  - Bookings: {len(self.df)}\n  - Vehicles: {self.df['vehicle_id'].nunique()}\n  - Users: {self.df['user_id'].nunique()}"
+            else:
+                return f"❌ Error: Model file not found at {model_path}"
 
         except Exception as e:
             logger.error(f"Error loading system: {e}")
-            return f"❌ Error: {str(e)}"
+            import traceback
+            return f"❌ Error: {str(e)}\n\n{traceback.format_exc()}"
 
     def make_prediction(
         self,
