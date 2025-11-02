@@ -26,6 +26,7 @@ from .models import (
 
 from ..models.prediction_service import BatteryPredictionService
 from ..data.data_loader import BookingDataLoader
+from ..monitoring.accuracy import get_accuracy_monitor
 from ..utils.logger import logger
 from ..utils.config_loader import config
 
@@ -118,7 +119,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "Battery Prediction API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "endpoints": {
             "health": "/health",
@@ -126,7 +127,22 @@ async def root():
             "predict_batch": "/api/v1/predict/batch",
             "booking_created": "/api/v1/booking/created",
             "timeline": "/api/v1/vehicle/{vehicle_id}/timeline",
-            "model_info": "/api/v1/model/info"
+            "model_info": "/api/v1/model/info",
+            "events": {
+                "booking_created": "/api/v1/events/booking-created",
+                "booking_started": "/api/v1/events/booking-started",
+                "booking_ended": "/api/v1/events/booking-ended",
+                "booking_modified": "/api/v1/events/booking-modified",
+                "booking_cancelled": "/api/v1/events/booking-cancelled"
+            },
+            "accuracy": {
+                "overall": "/api/v1/accuracy/overall?days=30",
+                "vehicle": "/api/v1/accuracy/vehicle/{vehicle_id}?days=30",
+                "over_time": "/api/v1/accuracy/over-time?days=30",
+                "error_distribution": "/api/v1/accuracy/error-distribution?days=30",
+                "top_vehicles": "/api/v1/accuracy/top-vehicles?limit=10",
+                "worst_predictions": "/api/v1/accuracy/worst-predictions?limit=10"
+            }
         }
     }
 
@@ -361,6 +377,127 @@ async def get_vehicle_timeline(
 
     except Exception as e:
         logger.error(f"Error getting timeline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Accuracy Monitoring Endpoints
+
+@app.get("/api/v1/accuracy/overall", response_model=dict, dependencies=[Depends(verify_api_key)])
+async def get_overall_accuracy(days: int = 30):
+    """
+    Get overall prediction accuracy metrics
+
+    Query Parameters:
+    - days: Number of days to look back (default: 30)
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        metrics = monitor.calculate_overall_metrics(days=days)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error calculating accuracy metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accuracy/vehicle/{vehicle_id}", response_model=dict, dependencies=[Depends(verify_api_key)])
+async def get_vehicle_accuracy(vehicle_id: int, days: int = 30):
+    """
+    Get accuracy metrics for a specific vehicle
+
+    Path Parameters:
+    - vehicle_id: Vehicle ID
+
+    Query Parameters:
+    - days: Number of days to look back (default: 30)
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        metrics = monitor.calculate_vehicle_metrics(vehicle_id=vehicle_id, days=days)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error calculating vehicle accuracy: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accuracy/over-time", response_model=list, dependencies=[Depends(verify_api_key)])
+async def get_accuracy_over_time(days: int = 30):
+    """
+    Get accuracy metrics over time for charting
+
+    Query Parameters:
+    - days: Number of days to look back (default: 30)
+
+    Returns:
+    List of daily metrics with MAE and within_10_pct
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        metrics = monitor.get_accuracy_over_time(days=days)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error getting accuracy over time: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accuracy/error-distribution", response_model=dict, dependencies=[Depends(verify_api_key)])
+async def get_error_distribution(days: int = 30):
+    """
+    Get distribution of prediction errors (for histogram)
+
+    Query Parameters:
+    - days: Number of days to look back (default: 30)
+
+    Returns:
+    Error buckets with counts
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        distribution = monitor.get_error_distribution(days=days)
+        return distribution
+    except Exception as e:
+        logger.error(f"Error getting error distribution: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accuracy/top-vehicles", response_model=list, dependencies=[Depends(verify_api_key)])
+async def get_top_vehicles(limit: int = 10, days: int = 30):
+    """
+    Get vehicles with best prediction accuracy
+
+    Query Parameters:
+    - limit: Number of vehicles to return (default: 10)
+    - days: Number of days to look back (default: 30)
+
+    Returns:
+    List of vehicles sorted by MAE (best first)
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        vehicles = monitor.get_top_vehicles_by_accuracy(limit=limit, days=days)
+        return vehicles
+    except Exception as e:
+        logger.error(f"Error getting top vehicles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accuracy/worst-predictions", response_model=list, dependencies=[Depends(verify_api_key)])
+async def get_worst_predictions(limit: int = 10, days: int = 30):
+    """
+    Get predictions with largest errors (for debugging)
+
+    Query Parameters:
+    - limit: Number of predictions to return (default: 10)
+    - days: Number of days to look back (default: 30)
+
+    Returns:
+    List of worst predictions sorted by absolute error
+    """
+    try:
+        monitor = get_accuracy_monitor()
+        predictions = monitor.get_worst_predictions(limit=limit, days=days)
+        return predictions
+    except Exception as e:
+        logger.error(f"Error getting worst predictions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
