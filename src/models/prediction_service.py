@@ -262,6 +262,211 @@ class BatteryPredictionService:
             'updated_predictions': updated_predictions
         }
 
+    def predict_from_current_state(
+        self,
+        vehicle_id: str,
+        user_id: str,
+        booking_start_time: datetime,
+        current_battery_level: float,
+        current_timestamp: Optional[datetime] = None,
+        intermediate_bookings: Optional[List[Dict]] = None,
+        booking_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Predict battery from CURRENT real-time state (not historical)
+
+        This method handles the realistic scenario where:
+        - You know the current battery level RIGHT NOW
+        - There may be scheduled bookings between now and target time
+        - You need to estimate battery changes through those bookings
+
+        Args:
+            vehicle_id: Vehicle ID
+            user_id: User making the target booking
+            booking_start_time: Target prediction time
+            current_battery_level: Current battery % (from vehicle telemetry)
+            current_timestamp: Current time (defaults to now)
+            intermediate_bookings: Scheduled bookings between now and target, format:
+                [{"starts_at": datetime, "ends_at": datetime, "user_id": optional}]
+            booking_id: Optional booking ID for tracking
+
+        Returns:
+            Dictionary with prediction results including cascade steps
+        """
+
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
+
+        # Validate inputs
+        if not (0 <= current_battery_level <= 100):
+            raise ValueError(f"current_battery_level must be between 0-100, got {current_battery_level}")
+
+        if current_timestamp is None:
+            current_timestamp = datetime.now()
+
+        if booking_start_time <= current_timestamp:
+            raise ValueError("booking_start_time must be in the future")
+
+        # Get vehicle stats for estimation
+        vehicle_data = self.historical_data[self.historical_data['vehicle_id'] == vehicle_id]
+
+        if len(vehicle_data) == 0:
+            raise ValueError(f"No historical data found for vehicle {vehicle_id}")
+
+        # Calculate vehicle's average battery drain per hour
+        vehicle_data_with_drain = vehicle_data[vehicle_data['battery_at_start'] > vehicle_data['battery_at_end']].copy()
+        if len(vehicle_data_with_drain) > 0:
+            vehicle_data_with_drain['duration_hours'] = (
+                vehicle_data_with_drain['ends_at'] - vehicle_data_with_drain['starts_at']
+            ).dt.total_seconds() / 3600
+            vehicle_data_with_drain['drain_per_hour'] = (
+                (vehicle_data_with_drain['battery_at_start'] - vehicle_data_with_drain['battery_at_end']) /
+                vehicle_data_with_drain['duration_hours']
+            )
+            avg_drain_per_hour = vehicle_data_with_drain['drain_per_hour'].median()
+        else:
+            avg_drain_per_hour = 5.0  # Default: 5% per hour
+
+        # Cascade prediction through intermediate bookings
+        cascade_steps = []
+        current_battery = current_battery_level
+        current_time = current_timestamp
+
+        # Sort intermediate bookings by time
+        if intermediate_bookings:
+            intermediate_bookings = sorted(intermediate_bookings, key=lambda x: x['starts_at'])
+        else:
+            intermediate_bookings = []
+
+        # Process each intermediate booking
+        for booking in intermediate_bookings:
+            booking_start = booking['starts_at']
+            booking_end = booking['ends_at']
+
+            # 1. Idle period before booking starts
+            if booking_start > current_time:
+                idle_hours = (booking_start - current_time).total_seconds() / 3600
+                # Small natural drain during idle (0.5% per hour)
+                idle_drain = idle_hours * 0.5
+                current_battery = max(0, current_battery - idle_drain)
+
+                cascade_steps.append({
+                    'type': 'idle',
+                    'from': current_time.isoformat(),
+                    'to': booking_start.isoformat(),
+                    'duration_hours': idle_hours,
+                    'battery_change': -idle_drain,
+                    'battery_after': current_battery
+                })
+
+                current_time = booking_start
+
+            # 2. During booking - estimate drain
+            booking_duration_hours = (booking_end - booking_start).total_seconds() / 3600
+            estimated_drain = booking_duration_hours * avg_drain_per_hour
+            current_battery = max(0, current_battery - estimated_drain)
+
+            cascade_steps.append({
+                'type': 'booking',
+                'from': booking_start.isoformat(),
+                'to': booking_end.isoformat(),
+                'duration_hours': booking_duration_hours,
+                'battery_change': -estimated_drain,
+                'battery_after': current_battery,
+                'user_id': booking.get('user_id', 'unknown')
+            })
+
+            current_time = booking_end
+
+        # 3. Final idle period to target time
+        if booking_start_time > current_time:
+            final_idle_hours = (booking_start_time - current_time).total_seconds() / 3600
+
+            # Check if charging might occur (long idle period > 4 hours)
+            if final_idle_hours > 4:
+                # Use ML model to predict (may include charging)
+                # Create a temporary booking row for prediction
+                pred_row = pd.DataFrame([{
+                    'booking_id': f"TEMP_{datetime.now().timestamp()}",
+                    'vehicle_id': vehicle_id,
+                    'user_id': user_id,
+                    'starts_at': booking_start_time,
+                    'ends_at': booking_start_time + timedelta(hours=2),
+                    'battery_at_start': 0,  # Will predict this
+                    'battery_at_end': current_battery,  # Current state
+                    'mileage_at_start': 0,
+                    'mileage_at_end': 0,
+                    'charging_at_end': 0
+                }])
+
+                # Use enhanced features to capture charging patterns
+                from ..features.enhanced_features import EnhancedBatteryFeatures
+                enhancer = EnhancedBatteryFeatures()
+
+                # Combine with historical data
+                combined = pd.concat([self.historical_data, pred_row]).sort_values(['vehicle_id', 'starts_at'])
+                enhanced = enhancer.create_charging_features(combined, is_training=False)
+                enhanced = self.model.feature_engineer.create_features(enhanced, is_training=False)
+
+                # Get prediction row
+                pred_features = enhanced[enhanced['booking_id'] == pred_row['booking_id'].iloc[0]]
+
+                # Predict
+                X = pred_features[self.model.feature_names]
+                prediction = float(self.model.model.predict(X)[0])
+                predicted_battery = np.clip(prediction, 0, 100)
+
+                battery_change = predicted_battery - current_battery
+
+                cascade_steps.append({
+                    'type': 'idle_with_ml_prediction',
+                    'from': current_time.isoformat(),
+                    'to': booking_start_time.isoformat(),
+                    'duration_hours': final_idle_hours,
+                    'battery_change': battery_change,
+                    'battery_after': predicted_battery,
+                    'note': 'ML model used for long idle period (possible charging)'
+                })
+
+                final_battery = predicted_battery
+            else:
+                # Short idle: just natural drain
+                idle_drain = final_idle_hours * 0.5
+                final_battery = max(0, current_battery - idle_drain)
+
+                cascade_steps.append({
+                    'type': 'idle',
+                    'from': current_time.isoformat(),
+                    'to': booking_start_time.isoformat(),
+                    'duration_hours': final_idle_hours,
+                    'battery_change': -idle_drain,
+                    'battery_after': final_battery
+                })
+        else:
+            final_battery = current_battery
+
+        # Build result
+        result = {
+            'booking_id': booking_id,
+            'vehicle_id': vehicle_id,
+            'user_id': user_id,
+            'booking_start_time': booking_start_time.isoformat(),
+            'predicted_battery_percentage': float(final_battery),
+            'confidence_interval': {
+                'lower': max(0, final_battery - 10),
+                'upper': min(100, final_battery + 10),
+                'confidence_level': 0.95
+            },
+            'current_battery_level': current_battery_level,
+            'current_timestamp': current_timestamp.isoformat(),
+            'cascade_steps': cascade_steps,
+            'total_intermediate_bookings': len(intermediate_bookings),
+            'prediction_method': 'real_time_cascade',
+            'timestamp': datetime.now().isoformat()
+        }
+
+        return result
+
     def get_vehicle_timeline_with_predictions(
         self,
         vehicle_id: str,

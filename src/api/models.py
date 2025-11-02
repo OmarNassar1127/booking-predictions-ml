@@ -7,6 +7,22 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 
+class IntermediateBooking(BaseModel):
+    """Scheduled booking between now and target time"""
+    starts_at: str = Field(..., description="ISO format datetime when booking starts")
+    ends_at: str = Field(..., description="ISO format datetime when booking ends")
+    user_id: Optional[str] = Field(None, description="User ID for this booking (optional)")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "starts_at": "2024-12-24T13:00:00",
+                "ends_at": "2024-12-24T15:00:00",
+                "user_id": "U0099"
+            }
+        }
+
+
 class PredictionRequest(BaseModel):
     """Request model for single battery prediction"""
     vehicle_id: str = Field(..., description="Unique identifier for the vehicle")
@@ -15,14 +31,32 @@ class PredictionRequest(BaseModel):
     booking_id: Optional[str] = Field(None, description="Unique booking identifier (optional)")
     update_timeline: bool = Field(True, description="Whether to add this booking to the timeline")
 
+    # Real-time prediction parameters (NEW)
+    current_battery_level: Optional[float] = Field(None, description="Current battery % from vehicle telemetry (0-100). If provided, uses real-time prediction instead of historical.")
+    current_timestamp: Optional[str] = Field(None, description="Current time (ISO format). Defaults to now if not provided.")
+    intermediate_bookings: Optional[List[IntermediateBooking]] = Field(None, description="Scheduled bookings between current time and target time")
+
     class Config:
         schema_extra = {
             "example": {
                 "vehicle_id": "V001",
                 "user_id": "U0042",
-                "booking_start_time": "2024-12-25T14:30:00Z",
+                "booking_start_time": "2024-12-25T19:00:00Z",
                 "booking_id": "BK123456",
-                "update_timeline": True
+                "update_timeline": True,
+                "current_battery_level": 65.5,
+                "current_timestamp": "2024-12-24T12:00:00Z",
+                "intermediate_bookings": [
+                    {
+                        "starts_at": "2024-12-24T13:00:00Z",
+                        "ends_at": "2024-12-24T15:00:00Z",
+                        "user_id": "U0099"
+                    },
+                    {
+                        "starts_at": "2024-12-24T17:00:00Z",
+                        "ends_at": "2024-12-24T19:00:00Z"
+                    }
+                ]
             }
         }
 
@@ -46,6 +80,12 @@ class PredictionResponse(BaseModel):
     time_since_last_booking_hours: Optional[float] = Field(None, description="Hours since last booking")
     intermediate_bookings_count: int = Field(..., description="Number of bookings between last and this one")
     timestamp: str = Field(..., description="When this prediction was made")
+
+    # Real-time prediction fields (NEW)
+    prediction_method: Optional[str] = Field(None, description="Method used: 'historical' or 'real_time_cascade'")
+    current_battery_level: Optional[float] = Field(None, description="Current battery level if real-time prediction")
+    current_timestamp: Optional[str] = Field(None, description="Current timestamp if real-time prediction")
+    cascade_steps: Optional[List[Dict[str, Any]]] = Field(None, description="Step-by-step battery changes through intermediate bookings")
 
     class Config:
         schema_extra = {

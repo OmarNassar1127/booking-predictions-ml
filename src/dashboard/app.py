@@ -97,9 +97,10 @@ class BatteryPredictionDashboard:
         vehicle_id: str,
         user_id: str,
         booking_date: str,
-        booking_time: str
+        booking_time: str,
+        current_battery: float = None
     ) -> tuple:
-        """Make a prediction"""
+        """Make a prediction (supports both historical and real-time modes)"""
 
         if not self.model_loaded:
             return "❌ Please load the system first", None
@@ -112,70 +113,139 @@ class BatteryPredictionDashboard:
             # Parse datetime
             booking_datetime = datetime.fromisoformat(f"{booking_date}T{booking_time}")
 
-            # Create a simple prediction using the model directly
-            # Get last booking for this vehicle
-            vehicle_data = self.df[self.df['vehicle_id'] == vehicle_id].sort_values('starts_at')
+            # Check which prediction mode to use
+            if current_battery is not None and current_battery > 0:
+                # REAL-TIME MODE
+                result = self.service.predict_from_current_state(
+                    vehicle_id=vehicle_id,
+                    user_id=user_id,
+                    booking_start_time=booking_datetime,
+                    current_battery_level=current_battery,
+                    current_timestamp=datetime.now(),
+                    intermediate_bookings=None,  # Could be extended in future
+                    booking_id=None
+                )
 
-            if len(vehicle_data) == 0:
-                return f"❌ No historical data found for vehicle {vehicle_id}", None
+                # Format output for real-time mode
+                output = f"""
+## 🔮 Real-Time Prediction Result
 
-            last_booking = vehicle_data.iloc[-1]
+**Vehicle:** {result['vehicle_id']}
+**User:** {result['user_id']}
+**Booking Time:** {result['booking_start_time']}
 
-            # Create prediction row
-            from src.features.enhanced_features import EnhancedBatteryFeatures
+### Current State
+- **Current Battery:** {result['current_battery_level']:.1f}%
+- **Current Time:** {result['current_timestamp']}
 
-            pred_row = pd.DataFrame([{
-                'booking_id': f"PRED_{datetime.now().timestamp()}",
-                'vehicle_id': vehicle_id,
-                'user_id': user_id,
-                'starts_at': booking_datetime,
-                'ends_at': booking_datetime + timedelta(hours=2),
-                'battery_at_start': 0,  # Predicting this
-                'battery_at_end': 0,
-                'mileage_at_start': 0,
-                'mileage_at_end': 0,
-                'charging_at_end': 0
-            }])
+### Predicted Battery
+**{result['predicted_battery_percentage']:.1f}%**
 
-            # Add enhanced charging features
-            enhancer = EnhancedBatteryFeatures()
-            enhancer.vehicle_charging_stats = self.service.model.feature_engineer.vehicle_stats if hasattr(self.service.model, 'feature_engineer') else {}
-            enhancer.user_charging_stats = self.service.model.feature_engineer.user_stats if hasattr(self.service.model, 'feature_engineer') else {}
+### Confidence Interval (95%)
+- Lower Bound: {result['confidence_interval']['lower']:.1f}%
+- Upper Bound: {result['confidence_interval']['upper']:.1f}%
 
-            # Combine with historical data for feature creation
-            combined = pd.concat([self.df, pred_row]).sort_values(['vehicle_id', 'starts_at'])
-            enhanced = enhancer.create_charging_features(combined, is_training=False)
-            enhanced = self.service.model.feature_engineer.create_features(enhanced, is_training=False)
+### Prediction Steps
+"""
+                # Add cascade steps if available
+                if result.get('cascade_steps'):
+                    for i, step in enumerate(result['cascade_steps'], 1):
+                        step_type = step['type'].replace('_', ' ').title()
+                        output += f"\n**Step {i} - {step_type}:**\n"
+                        output += f"- Duration: {step['duration_hours']:.1f} hours\n"
+                        output += f"- Battery Change: {step['battery_change']:+.1f}%\n"
+                        output += f"- Battery After: {step['battery_after']:.1f}%\n"
 
-            # Get the prediction row
-            pred_features = enhanced[enhanced['booking_id'] == pred_row['booking_id'].iloc[0]]
+                output += f"\n\n**Prediction Method:** Real-time cascade with {result['total_intermediate_bookings']} intermediate booking(s)"
 
-            # Make prediction
-            X = pred_features[self.service.model.feature_names]
-            prediction = float(self.service.model.model.predict(X)[0])
-            prediction = np.clip(prediction, 0, 100)
+                # Create visualization
+                fig = go.Figure()
 
-            # Create result dict
-            result = {
-                'booking_id': f"PRED_{datetime.now().timestamp()}",
-                'vehicle_id': vehicle_id,
-                'user_id': user_id,
-                'booking_start_time': booking_datetime.isoformat(),
-                'predicted_battery_percentage': prediction,
-                'confidence_interval': {
-                    'lower': max(0, prediction - 10),
-                    'upper': min(100, prediction + 10),
-                    'confidence_level': 0.95
-                },
-                'last_known_battery': float(last_booking['battery_at_end']),
-                'time_since_last_booking_hours': float((booking_datetime - last_booking['ends_at']).total_seconds() / 3600),
-                'intermediate_bookings_count': 0,
-                'timestamp': datetime.now().isoformat()
-            }
+                # Add current and predicted battery
+                fig.add_trace(go.Bar(
+                    x=['Current', 'Predicted'],
+                    y=[result['current_battery_level'], result['predicted_battery_percentage']],
+                    marker_color=['blue', 'green'],
+                    text=[f"{result['current_battery_level']:.1f}%", f"{result['predicted_battery_percentage']:.1f}%"],
+                    textposition='auto'
+                ))
 
-            # Format output
-            output = f"""
-## Prediction Result
+                fig.update_layout(
+                    title='Real-Time Battery Prediction',
+                    yaxis_title='Battery %',
+                    yaxis_range=[0, 100],
+                    showlegend=False,
+                    height=400
+                )
+
+                return output, fig
+
+            else:
+                # HISTORICAL MODE (original behavior)
+                # Create a simple prediction using the model directly
+                # Get last booking for this vehicle
+                vehicle_data = self.df[self.df['vehicle_id'] == vehicle_id].sort_values('starts_at')
+
+                if len(vehicle_data) == 0:
+                    return f"❌ No historical data found for vehicle {vehicle_id}", None
+
+                last_booking = vehicle_data.iloc[-1]
+
+                # Create prediction row
+                from src.features.enhanced_features import EnhancedBatteryFeatures
+
+                pred_row = pd.DataFrame([{
+                    'booking_id': f"PRED_{datetime.now().timestamp()}",
+                    'vehicle_id': vehicle_id,
+                    'user_id': user_id,
+                    'starts_at': booking_datetime,
+                    'ends_at': booking_datetime + timedelta(hours=2),
+                    'battery_at_start': 0,  # Predicting this
+                    'battery_at_end': 0,
+                    'mileage_at_start': 0,
+                    'mileage_at_end': 0,
+                    'charging_at_end': 0
+                }])
+
+                # Add enhanced charging features
+                enhancer = EnhancedBatteryFeatures()
+                enhancer.vehicle_charging_stats = self.service.model.feature_engineer.vehicle_stats if hasattr(self.service.model, 'feature_engineer') else {}
+                enhancer.user_charging_stats = self.service.model.feature_engineer.user_stats if hasattr(self.service.model, 'feature_engineer') else {}
+
+                # Combine with historical data for feature creation
+                combined = pd.concat([self.df, pred_row]).sort_values(['vehicle_id', 'starts_at'])
+                enhanced = enhancer.create_charging_features(combined, is_training=False)
+                enhanced = self.service.model.feature_engineer.create_features(enhanced, is_training=False)
+
+                # Get the prediction row
+                pred_features = enhanced[enhanced['booking_id'] == pred_row['booking_id'].iloc[0]]
+
+                # Make prediction
+                X = pred_features[self.service.model.feature_names]
+                prediction = float(self.service.model.model.predict(X)[0])
+                prediction = np.clip(prediction, 0, 100)
+
+                # Create result dict
+                result = {
+                    'booking_id': f"PRED_{datetime.now().timestamp()}",
+                    'vehicle_id': vehicle_id,
+                    'user_id': user_id,
+                    'booking_start_time': booking_datetime.isoformat(),
+                    'predicted_battery_percentage': prediction,
+                    'confidence_interval': {
+                        'lower': max(0, prediction - 10),
+                        'upper': min(100, prediction + 10),
+                        'confidence_level': 0.95
+                    },
+                    'last_known_battery': float(last_booking['battery_at_end']),
+                    'time_since_last_booking_hours': float((booking_datetime - last_booking['ends_at']).total_seconds() / 3600),
+                    'intermediate_bookings_count': 0,
+                    'timestamp': datetime.now().isoformat()
+                }
+
+                # Format output
+                output = f"""
+## Prediction Result (Historical Mode)
 
 **Vehicle:** {result['vehicle_id']}
 **User:** {result['user_id']}
@@ -192,42 +262,42 @@ class BatteryPredictionDashboard:
 - Last Known Battery: {result['last_known_battery']:.1f}%
 - Time Since Last Booking: {result['time_since_last_booking_hours']:.1f} hours
 - Intermediate Bookings: {result['intermediate_bookings_count']}
-            """
+                """
 
-            # Create visualization
-            fig = go.Figure()
+                # Create visualization
+                fig = go.Figure()
 
-            # Add prediction with confidence interval
-            fig.add_trace(go.Bar(
-                x=['Prediction'],
-                y=[result['predicted_battery_percentage']],
-                name='Predicted Battery',
-                marker_color='green',
-                error_y=dict(
-                    type='data',
-                    symmetric=False,
-                    array=[result['confidence_interval']['upper'] - result['predicted_battery_percentage']],
-                    arrayminus=[result['predicted_battery_percentage'] - result['confidence_interval']['lower']]
-                )
-            ))
-
-            if result['last_known_battery']:
+                # Add prediction with confidence interval
                 fig.add_trace(go.Bar(
-                    x=['Last Known'],
-                    y=[result['last_known_battery']],
-                    name='Last Known Battery',
-                    marker_color='blue'
+                    x=['Prediction'],
+                    y=[result['predicted_battery_percentage']],
+                    name='Predicted Battery',
+                    marker_color='green',
+                    error_y=dict(
+                        type='data',
+                        symmetric=False,
+                        array=[result['confidence_interval']['upper'] - result['predicted_battery_percentage']],
+                        arrayminus=[result['predicted_battery_percentage'] - result['confidence_interval']['lower']]
+                    )
                 ))
 
-            fig.update_layout(
-                title='Battery Prediction',
-                yaxis_title='Battery %',
-                yaxis_range=[0, 100],
-                showlegend=True,
-                height=400
-            )
+                if result['last_known_battery']:
+                    fig.add_trace(go.Bar(
+                        x=['Last Known'],
+                        y=[result['last_known_battery']],
+                        name='Last Known Battery',
+                        marker_color='blue'
+                    ))
 
-            return output, fig
+                fig.update_layout(
+                    title='Historical Mode Prediction',
+                    yaxis_title='Battery %',
+                    yaxis_range=[0, 100],
+                    showlegend=True,
+                    height=400
+                )
+
+                return output, fig
 
         except Exception as e:
             logger.error(f"Error making prediction: {e}")
@@ -502,13 +572,28 @@ class BatteryPredictionDashboard:
 
             with gr.Tab("🔮 Make Prediction"):
                 gr.Markdown("## Predict Battery at Booking Start")
+                gr.Markdown("""
+                **Two prediction modes:**
+                1. **Historical**: Leave "Current Battery %" empty - predicts from last known booking
+                2. **Real-time** (recommended): Enter current battery % - predicts from current state
+                """)
 
                 with gr.Row():
                     with gr.Column():
-                        pred_vehicle = gr.Textbox(label="Vehicle ID", placeholder="e.g., V001")
-                        pred_user = gr.Textbox(label="User ID", placeholder="e.g., U0001")
+                        pred_vehicle = gr.Textbox(label="Vehicle ID", placeholder="e.g., 78")
+                        pred_user = gr.Textbox(label="User ID", placeholder="e.g., 860")
                         pred_date = gr.Textbox(label="Booking Date", placeholder="YYYY-MM-DD")
                         pred_time = gr.Textbox(label="Booking Time", value="14:00:00")
+
+                        gr.Markdown("---")
+                        gr.Markdown("**Real-time Mode (Optional)**")
+                        pred_current_battery = gr.Number(
+                            label="Current Battery % (optional)",
+                            placeholder="Leave empty for historical mode",
+                            minimum=0,
+                            maximum=100
+                        )
+
                         predict_btn = gr.Button("Predict", variant="primary")
 
                     with gr.Column():
@@ -517,7 +602,7 @@ class BatteryPredictionDashboard:
 
                 predict_btn.click(
                     fn=self.make_prediction,
-                    inputs=[pred_vehicle, pred_user, pred_date, pred_time],
+                    inputs=[pred_vehicle, pred_user, pred_date, pred_time, pred_current_battery],
                     outputs=[pred_output, pred_plot]
                 )
 

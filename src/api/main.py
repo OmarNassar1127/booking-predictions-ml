@@ -29,11 +29,14 @@ from ..data.data_loader import BookingDataLoader
 from ..utils.logger import logger
 from ..utils.config_loader import config
 
+# Import event router
+from . import events
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Battery Prediction API",
     description="REST API for predicting electric car battery levels at booking start",
-    version="1.0.0"
+    version="2.0.0"  # Updated for event-driven system
 )
 
 # CORS middleware for Laravel integration
@@ -44,6 +47,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include event router
+app.include_router(events.router)
 
 # Global prediction service instance
 prediction_service: Optional[BatteryPredictionService] = None
@@ -97,6 +103,10 @@ async def startup_event():
             logger.warning(f"Model file not found at {model_path}")
             logger.warning("API will start but predictions will fail until model is loaded")
             prediction_service = BatteryPredictionService(historical_data=df)
+
+        # Pass prediction service to event handlers
+        events.set_prediction_service(prediction_service)
+        logger.info("Event handlers initialized with prediction service")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -159,25 +169,85 @@ async def predict_battery(request: PredictionRequest):
     """
     Predict battery percentage at start of a booking
 
-    This endpoint is called by Laravel when a new booking is being created
-    to show the user the expected battery level.
+    This endpoint supports two prediction modes:
+
+    1. **Historical mode** (default): Predicts from last known booking in database
+       - Use when you don't have real-time battery data
+       - Just pass vehicle_id, user_id, booking_start_time
+
+    2. **Real-time mode** (recommended for production): Predicts from current battery level
+       - Use when you have real-time vehicle telemetry
+       - Pass current_battery_level to enable this mode
+       - Optionally include intermediate_bookings for more accurate predictions
+
+    Example real-time request:
+    ```json
+    {
+      "vehicle_id": "V001",
+      "user_id": "U0042",
+      "booking_start_time": "2024-12-25T19:00:00Z",
+      "current_battery_level": 65.5,
+      "intermediate_bookings": [
+        {"starts_at": "2024-12-24T13:00:00Z", "ends_at": "2024-12-24T15:00:00Z"}
+      ]
+    }
+    ```
     """
 
     if prediction_service is None or prediction_service.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
-        # Parse datetime
+        # Parse booking start time
         booking_start_time = datetime.fromisoformat(request.booking_start_time.replace('Z', '+00:00'))
 
-        # Make prediction
-        result = prediction_service.predict_battery_at_start(
-            vehicle_id=request.vehicle_id,
-            user_id=request.user_id,
-            booking_start_time=booking_start_time,
-            booking_id=request.booking_id,
-            update_timeline=request.update_timeline
-        )
+        # Check if real-time prediction is requested
+        if request.current_battery_level is not None:
+            # REAL-TIME MODE: Use current battery level
+            logger.info(f"Real-time prediction for vehicle {request.vehicle_id} with current battery {request.current_battery_level}%")
+
+            # Parse current timestamp
+            current_timestamp = None
+            if request.current_timestamp:
+                current_timestamp = datetime.fromisoformat(request.current_timestamp.replace('Z', '+00:00'))
+
+            # Parse intermediate bookings
+            intermediate_bookings = None
+            if request.intermediate_bookings:
+                intermediate_bookings = [
+                    {
+                        'starts_at': datetime.fromisoformat(b.starts_at.replace('Z', '+00:00')),
+                        'ends_at': datetime.fromisoformat(b.ends_at.replace('Z', '+00:00')),
+                        'user_id': b.user_id
+                    }
+                    for b in request.intermediate_bookings
+                ]
+
+            # Make real-time prediction
+            result = prediction_service.predict_from_current_state(
+                vehicle_id=request.vehicle_id,
+                user_id=request.user_id,
+                booking_start_time=booking_start_time,
+                current_battery_level=request.current_battery_level,
+                current_timestamp=current_timestamp,
+                intermediate_bookings=intermediate_bookings,
+                booking_id=request.booking_id
+            )
+
+        else:
+            # HISTORICAL MODE: Use last known booking from database
+            logger.info(f"Historical prediction for vehicle {request.vehicle_id}")
+
+            result = prediction_service.predict_battery_at_start(
+                vehicle_id=request.vehicle_id,
+                user_id=request.user_id,
+                booking_start_time=booking_start_time,
+                booking_id=request.booking_id,
+                update_timeline=request.update_timeline
+            )
+
+            # Add prediction method to result
+            result['prediction_method'] = 'historical'
 
         return PredictionResponse(**result)
 
