@@ -116,8 +116,8 @@ class BatteryPredictionDashboard:
 - Upper Bound: {result['confidence_interval']['upper']:.1f}%
 
 ### Context
-- Last Known Battery: {result['last_known_battery']:.1f}% if result['last_known_battery'] else 'N/A'}
-- Time Since Last Booking: {result['time_since_last_booking_hours']:.1f} hours if result['time_since_last_booking_hours'] else 'N/A'}
+- Last Known Battery: {result['last_known_battery']:.1f if result['last_known_battery'] else 'N/A'}%
+- Time Since Last Booking: {result['time_since_last_booking_hours']:.1f if result['time_since_last_booking_hours'] else 'N/A'} hours
 - Intermediate Bookings: {result['intermediate_bookings_count']}
             """
 
@@ -402,12 +402,12 @@ class BatteryPredictionDashboard:
                 with gr.Row():
                     data_path_input = gr.Textbox(
                         label="Data Path",
-                        value="data/raw/bookings.csv",
+                        value="data/processed/cleaned_bookings.csv",
                         placeholder="Path to bookings CSV"
                     )
                     model_path_input = gr.Textbox(
                         label="Model Path",
-                        value="models/battery_predictor.pkl",
+                        value="models/enhanced_battery_predictor.pkl",
                         placeholder="Path to model file"
                     )
 

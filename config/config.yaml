@@ -9,7 +9,7 @@ data:
 # Model configuration
 model:
   type: "lightgbm"  # Options: lightgbm, xgboost, ensemble
-  save_path: "models/battery_predictor.pkl"
+  save_path: "models/enhanced_battery_predictor.pkl"  # Enhanced model: 86.1% within 10%, MAE 4.37%
   feature_importance_path: "models/feature_importance.csv"
 
   # Model hyperparameters
