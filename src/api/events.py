@@ -55,6 +55,8 @@ class FutureBooking(BaseModel):
     user_id: int
     starts_at: str
     ends_at: str
+    charging_at_end: Optional[int] = Field(None, description="1 if this booking had charging, 0 otherwise (for completed bookings)")
+    battery_at_end: Optional[float] = Field(None, description="Battery % at end (for completed bookings)")
 
 
 class BookingStartedRequest(BaseModel):
@@ -356,12 +358,13 @@ async def handle_booking_ended(
             # Convert Pydantic models to dicts
             future_bookings_list = [booking.dict() for booking in request.future_bookings]
 
-            affected_bookings = cascade_predictor.find_and_repredict_after_booking_end(
+            # Pass charging_at_end to cascade predictor
+            affected_bookings = cascade_predictor.cascade_from_current_state(
                 vehicle_id=request.vehicle_id,
-                booking_id=request.booking_id,
-                battery_at_end=request.battery_at_end,
-                ends_at=ends_at,
-                future_bookings=future_bookings_list
+                current_battery_level=request.battery_at_end,
+                current_timestamp=ends_at,
+                future_bookings=future_bookings_list,
+                last_booking_had_charging=bool(request.charging_at_end)
             )
             logger.info(f"Re-predicted {len(affected_bookings)} future bookings")
 

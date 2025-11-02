@@ -109,6 +109,27 @@ class PatternUpdater:
 
         new_charging_frequency = total_charging_events / total_bookings if total_bookings > 0 else 0
 
+        # Learn charging rate if vehicle was charged
+        new_avg_charging_rate = current_patterns.get('avg_charging_rate_per_hour')
+        if charging_at_end == 1:
+            # Calculate charging rate from this booking
+            # We need to look at next booking's battery_at_start to know how much it charged
+            # For now, we'll estimate using typical EV charging rates or learn from historical data
+
+            # Try to get the next booking after this one to calculate actual charging gain
+            # If we can't, use default charging rate
+            charging_rate_observed = self._calculate_charging_rate_from_history(vehicle_id, ends_at)
+
+            if charging_rate_observed is not None:
+                new_avg_charging_rate = self._update_ema(
+                    current_value=current_patterns.get('avg_charging_rate_per_hour'),
+                    new_value=charging_rate_observed
+                )
+                logger.info(f"  Learned charging rate: {charging_rate_observed:.2f}%/h → avg: {new_avg_charging_rate:.2f}%/h")
+            elif new_avg_charging_rate is None:
+                # First time charging observed, use default
+                new_avg_charging_rate = 25.0  # Default: 25% per hour (typical Level 2 charging)
+
         # Calculate time since last booking
         last_booking_at = current_patterns.get('last_booking_at')
         time_between_charges = None
@@ -144,7 +165,7 @@ class PatternUpdater:
                 new_avg_drain_rate_per_hour,
                 new_avg_drain_rate_per_km,
                 new_std_drain_rate,
-                None,  # avg_charging_rate_per_hour - not calculated yet
+                new_avg_charging_rate,  # Now properly calculated
                 new_charging_frequency,
                 new_avg_time_between_charges,
                 total_bookings,
@@ -322,6 +343,67 @@ class PatternUpdater:
         }
 
     # Helper methods
+
+    def _calculate_charging_rate_from_history(
+        self,
+        vehicle_id: int,
+        charging_ended_at: datetime
+    ) -> Optional[float]:
+        """
+        Calculate charging rate by looking at next booking's battery level
+
+        Args:
+            vehicle_id: Vehicle ID
+            charging_ended_at: When this booking ended (with charging)
+
+        Returns:
+            Charging rate in % per hour, or None if can't calculate
+        """
+        # Get the next booking after this one from booking_outcomes
+        with self.tracker._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT battery_at_start, starts_at
+                FROM booking_outcomes
+                WHERE vehicle_id = ?
+                  AND starts_at > ?
+                ORDER BY starts_at ASC
+                LIMIT 1
+            """, (vehicle_id, charging_ended_at))
+            row = cursor.fetchone()
+
+            if not row:
+                return None
+
+            next_battery = row['battery_at_start']
+            next_starts_at = datetime.fromisoformat(row['starts_at'])
+
+            # Get current booking's end battery
+            cursor.execute("""
+                SELECT battery_at_end
+                FROM booking_outcomes
+                WHERE vehicle_id = ?
+                  AND ends_at = ?
+                LIMIT 1
+            """, (vehicle_id, charging_ended_at))
+            current_row = cursor.fetchone()
+
+            if not current_row:
+                return None
+
+            battery_at_end = current_row['battery_at_end']
+
+            # Calculate charging gain and time
+            battery_gained = next_battery - battery_at_end
+            time_gap_hours = (next_starts_at - charging_ended_at).total_seconds() / 3600
+
+            if time_gap_hours > 0 and battery_gained > 0:
+                charging_rate = battery_gained / time_gap_hours
+                # Sanity check: charging rate should be reasonable (5-50% per hour)
+                if 5 <= charging_rate <= 50:
+                    return charging_rate
+
+        return None
 
     def _get_vehicle_patterns(self, vehicle_id: int) -> Dict:
         """Get current vehicle patterns from database"""

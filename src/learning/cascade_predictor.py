@@ -38,7 +38,8 @@ class CascadePredictor:
         vehicle_id: int,
         current_battery_level: float,
         current_timestamp: datetime,
-        future_bookings: List[Dict]
+        future_bookings: List[Dict],
+        last_booking_had_charging: bool = False
     ) -> List[Dict]:
         """
         Re-predict all future bookings starting from current battery state
@@ -57,6 +58,8 @@ class CascadePredictor:
                 - user_id: User ID
                 - starts_at: Booking start time (datetime or ISO string)
                 - ends_at: Booking end time (datetime or ISO string)
+                - charging_at_end: Optional - 1 if had charging, 0 otherwise (for completed bookings)
+            last_booking_had_charging: Whether the last completed booking had charging_at_end = true
 
         Returns:
             List of updated predictions with booking_id and new predicted_battery
@@ -77,6 +80,7 @@ class CascadePredictor:
         updated_predictions = []
         simulated_battery = current_battery_level
         simulated_timestamp = current_timestamp
+        had_charging = last_booking_had_charging
 
         for i, booking in enumerate(sorted_bookings):
             try:
@@ -90,7 +94,8 @@ class CascadePredictor:
                     intermediate_bookings.append({
                         'starts_at': self._parse_datetime(prev_booking['starts_at']),
                         'ends_at': self._parse_datetime(prev_booking['ends_at']),
-                        'user_id': prev_booking.get('user_id')
+                        'user_id': prev_booking.get('user_id'),
+                        'charging_at_end': prev_booking.get('charging_at_end')
                     })
 
                 # Make prediction from current simulated state
@@ -101,7 +106,8 @@ class CascadePredictor:
                     current_battery_level=simulated_battery,
                     current_timestamp=simulated_timestamp,
                     intermediate_bookings=intermediate_bookings if intermediate_bookings else None,
-                    booking_id=booking['booking_id']
+                    booking_id=booking['booking_id'],
+                    last_booking_had_charging=had_charging
                 )
 
                 # Store updated prediction
@@ -129,10 +135,20 @@ class CascadePredictor:
                 logger.info(f"  [{i+1}/{len(sorted_bookings)}] Booking {booking['booking_id']}: {result['predicted_battery_percentage']:.1f}%")
 
                 # Update simulated state for next booking
-                # Assume this booking will end at predicted level (rough approximation)
-                # In reality, we don't know what battery it will end at, so we use patterns
-                simulated_battery = result.get('predicted_battery_at_end', simulated_battery * 0.8)
+                # Get the cascade steps to find the final battery after this booking
+                cascade_steps = result.get('cascade_steps', [])
+                if cascade_steps:
+                    # Find the last step's battery level
+                    last_step = cascade_steps[-1]
+                    simulated_battery = last_step.get('battery_after', result['predicted_battery_percentage'])
+                else:
+                    # Fallback: assume some drain during booking (rough approximation)
+                    simulated_battery = result['predicted_battery_percentage'] * 0.85
+
                 simulated_timestamp = ends_at
+
+                # Track if this booking had charging for next iteration
+                had_charging = booking.get('charging_at_end', False)
 
             except Exception as e:
                 logger.error(f"Error re-predicting booking {booking['booking_id']}: {e}")

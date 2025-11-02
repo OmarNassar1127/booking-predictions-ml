@@ -270,7 +270,8 @@ class BatteryPredictionService:
         current_battery_level: float,
         current_timestamp: Optional[datetime] = None,
         intermediate_bookings: Optional[List[Dict]] = None,
-        booking_id: Optional[str] = None
+        booking_id: Optional[str] = None,
+        last_booking_had_charging: bool = False
     ) -> Dict:
         """
         Predict battery from CURRENT real-time state (not historical)
@@ -287,8 +288,9 @@ class BatteryPredictionService:
             current_battery_level: Current battery % (from vehicle telemetry)
             current_timestamp: Current time (defaults to now)
             intermediate_bookings: Scheduled bookings between now and target, format:
-                [{"starts_at": datetime, "ends_at": datetime, "user_id": optional}]
+                [{"starts_at": datetime, "ends_at": datetime, "user_id": optional, "charging_at_end": optional bool}]
             booking_id: Optional booking ID for tracking
+            last_booking_had_charging: Whether the last completed booking had charging_at_end = true
 
         Returns:
             Dictionary with prediction results including cascade steps
@@ -313,24 +315,42 @@ class BatteryPredictionService:
         if len(vehicle_data) == 0:
             raise ValueError(f"No historical data found for vehicle {vehicle_id}")
 
-        # Calculate vehicle's average battery drain per hour
-        vehicle_data_with_drain = vehicle_data[vehicle_data['battery_at_start'] > vehicle_data['battery_at_end']].copy()
-        if len(vehicle_data_with_drain) > 0:
-            vehicle_data_with_drain['duration_hours'] = (
-                vehicle_data_with_drain['ends_at'] - vehicle_data_with_drain['starts_at']
-            ).dt.total_seconds() / 3600
-            vehicle_data_with_drain['drain_per_hour'] = (
-                (vehicle_data_with_drain['battery_at_start'] - vehicle_data_with_drain['battery_at_end']) /
-                vehicle_data_with_drain['duration_hours']
-            )
-            avg_drain_per_hour = vehicle_data_with_drain['drain_per_hour'].median()
+        # Get vehicle patterns from tracking database (includes learned charging rate)
+        from ..database.tracking import get_tracker
+        tracker = get_tracker()
+        with tracker._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT avg_drain_rate_per_hour, avg_charging_rate_per_hour
+                FROM vehicle_patterns
+                WHERE vehicle_id = ?
+            """, (vehicle_id,))
+            pattern_row = cursor.fetchone()
+
+        if pattern_row and pattern_row['avg_drain_rate_per_hour']:
+            avg_drain_per_hour = pattern_row['avg_drain_rate_per_hour']
+            avg_charging_rate_per_hour = pattern_row['avg_charging_rate_per_hour'] or 25.0
         else:
-            avg_drain_per_hour = 5.0  # Default: 5% per hour
+            # Fallback: Calculate from historical data
+            vehicle_data_with_drain = vehicle_data[vehicle_data['battery_at_start'] > vehicle_data['battery_at_end']].copy()
+            if len(vehicle_data_with_drain) > 0:
+                vehicle_data_with_drain['duration_hours'] = (
+                    vehicle_data_with_drain['ends_at'] - vehicle_data_with_drain['starts_at']
+                ).dt.total_seconds() / 3600
+                vehicle_data_with_drain['drain_per_hour'] = (
+                    (vehicle_data_with_drain['battery_at_start'] - vehicle_data_with_drain['battery_at_end']) /
+                    vehicle_data_with_drain['duration_hours']
+                )
+                avg_drain_per_hour = vehicle_data_with_drain['drain_per_hour'].median()
+            else:
+                avg_drain_per_hour = 5.0  # Default: 5% per hour
+            avg_charging_rate_per_hour = 25.0  # Default charging rate
 
         # Cascade prediction through intermediate bookings
         cascade_steps = []
         current_battery = current_battery_level
         current_time = current_timestamp
+        had_charging = last_booking_had_charging  # Track if previous booking had charging
 
         # Sort intermediate bookings by time
         if intermediate_bookings:
@@ -343,23 +363,41 @@ class BatteryPredictionService:
             booking_start = booking['starts_at']
             booking_end = booking['ends_at']
 
-            # 1. Idle period before booking starts
+            # 1. Gap period before booking starts (charging or idle)
             if booking_start > current_time:
-                idle_hours = (booking_start - current_time).total_seconds() / 3600
-                # Small natural drain during idle (0.5% per hour)
-                idle_drain = idle_hours * 0.5
-                current_battery = max(0, current_battery - idle_drain)
+                gap_hours = (booking_start - current_time).total_seconds() / 3600
 
-                cascade_steps.append({
-                    'type': 'idle',
-                    'from': current_time.isoformat(),
-                    'to': booking_start.isoformat(),
-                    'duration_hours': idle_hours,
-                    'battery_change': -idle_drain,
-                    'battery_after': current_battery
-                })
+                # Check if previous booking had charging
+                if had_charging:
+                    # Apply charging during gap
+                    battery_gain = min(gap_hours * avg_charging_rate_per_hour, 100 - current_battery)
+                    current_battery = min(100, current_battery + battery_gain)
+
+                    cascade_steps.append({
+                        'type': 'charging',
+                        'from': current_time.isoformat(),
+                        'to': booking_start.isoformat(),
+                        'duration_hours': gap_hours,
+                        'battery_change': battery_gain,
+                        'battery_after': current_battery,
+                        'charging_rate': avg_charging_rate_per_hour
+                    })
+                else:
+                    # Apply idle drain (no charging)
+                    idle_drain = gap_hours * 0.5  # 0.5% per hour idle drain
+                    current_battery = max(0, current_battery - idle_drain)
+
+                    cascade_steps.append({
+                        'type': 'idle',
+                        'from': current_time.isoformat(),
+                        'to': booking_start.isoformat(),
+                        'duration_hours': gap_hours,
+                        'battery_change': -idle_drain,
+                        'battery_after': current_battery
+                    })
 
                 current_time = booking_start
+                had_charging = False  # Reset after gap
 
             # 2. During booking - estimate drain
             booking_duration_hours = (booking_end - booking_start).total_seconds() / 3600
@@ -378,67 +416,38 @@ class BatteryPredictionService:
 
             current_time = booking_end
 
-        # 3. Final idle period to target time
+            # Track if this booking has charging for next gap
+            had_charging = booking.get('charging_at_end', False)
+
+        # 3. Final gap to target time (charging or idle)
         if booking_start_time > current_time:
-            final_idle_hours = (booking_start_time - current_time).total_seconds() / 3600
+            final_gap_hours = (booking_start_time - current_time).total_seconds() / 3600
 
-            # Check if charging might occur (long idle period > 4 hours)
-            if final_idle_hours > 4:
-                # Use ML model to predict (may include charging)
-                # Create a temporary booking row for prediction
-                pred_row = pd.DataFrame([{
-                    'booking_id': f"TEMP_{datetime.now().timestamp()}",
-                    'vehicle_id': vehicle_id,
-                    'user_id': user_id,
-                    'starts_at': booking_start_time,
-                    'ends_at': booking_start_time + timedelta(hours=2),
-                    'battery_at_start': 0,  # Will predict this
-                    'battery_at_end': current_battery,  # Current state
-                    'mileage_at_start': 0,
-                    'mileage_at_end': 0,
-                    'charging_at_end': 0
-                }])
-
-                # Use enhanced features to capture charging patterns
-                from ..features.enhanced_features import EnhancedBatteryFeatures
-                enhancer = EnhancedBatteryFeatures()
-
-                # Combine with historical data
-                combined = pd.concat([self.historical_data, pred_row]).sort_values(['vehicle_id', 'starts_at'])
-                enhanced = enhancer.create_charging_features(combined, is_training=False)
-                enhanced = self.model.feature_engineer.create_features(enhanced, is_training=False)
-
-                # Get prediction row
-                pred_features = enhanced[enhanced['booking_id'] == pred_row['booking_id'].iloc[0]]
-
-                # Predict
-                X = pred_features[self.model.feature_names]
-                prediction = float(self.model.model.predict(X)[0])
-                predicted_battery = np.clip(prediction, 0, 100)
-
-                battery_change = predicted_battery - current_battery
+            # Apply charging or idle drain based on had_charging flag
+            if had_charging:
+                # Apply charging during final gap
+                battery_gain = min(final_gap_hours * avg_charging_rate_per_hour, 100 - current_battery)
+                final_battery = min(100, current_battery + battery_gain)
 
                 cascade_steps.append({
-                    'type': 'idle_with_ml_prediction',
+                    'type': 'charging',
                     'from': current_time.isoformat(),
                     'to': booking_start_time.isoformat(),
-                    'duration_hours': final_idle_hours,
-                    'battery_change': battery_change,
-                    'battery_after': predicted_battery,
-                    'note': 'ML model used for long idle period (possible charging)'
+                    'duration_hours': final_gap_hours,
+                    'battery_change': battery_gain,
+                    'battery_after': final_battery,
+                    'charging_rate': avg_charging_rate_per_hour
                 })
-
-                final_battery = predicted_battery
             else:
-                # Short idle: just natural drain
-                idle_drain = final_idle_hours * 0.5
+                # Apply idle drain (no charging)
+                idle_drain = final_gap_hours * 0.5
                 final_battery = max(0, current_battery - idle_drain)
 
                 cascade_steps.append({
                     'type': 'idle',
                     'from': current_time.isoformat(),
                     'to': booking_start_time.isoformat(),
-                    'duration_hours': final_idle_hours,
+                    'duration_hours': final_gap_hours,
                     'battery_change': -idle_drain,
                     'battery_after': final_battery
                 })
